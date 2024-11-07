@@ -2,18 +2,22 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
 	"github.com/charmbracelet/log"
 	"github.com/joho/godotenv"
 	"github.com/redis/go-redis/v9"
-	"io/ioutil"
+	"io"
 	"net/http"
 	"time"
 	"weather-wrapper/helper"
+	"weather-wrapper/model"
 	"weather-wrapper/pkg"
 )
+
+const cacheExpiry = 24 * time.Hour
 
 func init() {
 	err := godotenv.Load()
@@ -33,34 +37,53 @@ func main() {
 
 	//read city name from cache
 	res, err := redisClient.Get(context.Background(), *city).Result()
-	if errors.Is(err, redis.Nil) {
-		log.Error(errors.New("no cache found"))
-		log.Info("make http request")
-	} else {
-		//if existed, return to user
-		log.Infof("cache hit!")
+	if err == nil {
+
+		log.Info("Cache hit!")
 		fmt.Println(res)
 		return
+	} else if !errors.Is(err, redis.Nil) {
+
+		log.Error("Error fetching from cache:", err)
 	}
 
 	//if not exist, make request and cache request
-
+	log.Info("Cache miss, making HTTP request")
 	requestUrl := helper.CreateRequestUrl(*city)
 
 	resp, err := http.Get(requestUrl)
 	if err != nil {
-		log.Error(err)
+		log.Error("HTTP request error:", err)
+		return
 	}
 	defer resp.Body.Close()
 
-	body, _ := ioutil.ReadAll(resp.Body)
-
-	if resp.StatusCode == 200 {
-		err := redisClient.Set(context.Background(), *city, string(body), 86400*time.Second).Err()
-		if err != nil {
-			log.Error(err)
-		}
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		log.Error("Error reading response body:", err)
+		return
+	}
+	if resp.StatusCode != http.StatusOK {
+		log.Error("Non-OK HTTP response status:", resp.StatusCode)
+		return
 	}
 
-	log.Infof(string(body))
+	var apiResponse model.ApiResponse
+
+	if err := json.Unmarshal(body, &apiResponse); err != nil {
+		log.Error("Error parsing JSON response:", err)
+		return
+	}
+
+	if apiResponse.Location.Name == "Wrong" {
+		log.Error("Invalid city name or data returned from API")
+		return
+	}
+
+	if err := redisClient.Set(context.Background(), *city, string(body), cacheExpiry).Err(); err != nil {
+		log.Error("Error caching response:", err)
+	}
+
+	// Print response body
+	log.Info("Weather data:", string(body))
 }
